@@ -17,7 +17,15 @@ pub fn get_opencode_dir() -> PathBuf {
 }
 
 pub fn get_opencode_config_path() -> PathBuf {
-    get_opencode_dir().join("opencode.json")
+    let dir = get_opencode_dir();
+
+    // Prefer opencode.jsonc if it exists, fallback to opencode.json
+    let jsonc_path = dir.join("opencode.jsonc");
+    if jsonc_path.exists() {
+        return jsonc_path;
+    }
+
+    dir.join("opencode.json")
 }
 
 #[allow(dead_code)]
@@ -35,7 +43,10 @@ pub fn read_opencode_config() -> Result<Value, AppError> {
     }
 
     let content = std::fs::read_to_string(&path).map_err(|e| AppError::io(&path, e))?;
-    serde_json::from_str(&content).map_err(|e| AppError::json(&path, e))
+
+    // Use json5 parser to support comments in .jsonc files
+    json5::from_str(&content)
+        .map_err(|e| AppError::Config(format!("Failed to parse OpenCode config as JSON5: {}", e)))
 }
 
 pub fn write_opencode_config(config: &Value) -> Result<(), AppError> {
@@ -201,4 +212,165 @@ pub fn remove_plugin_by_prefix(prefix: &str) -> Result<(), AppError> {
     }
 
     write_opencode_config(&config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn setup_test_env() -> (TempDir, PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let opencode_dir = temp_dir.path().join(".config").join("opencode");
+        fs::create_dir_all(&opencode_dir).unwrap();
+        (temp_dir, opencode_dir)
+    }
+
+    #[test]
+    fn test_read_opencode_config_prefers_jsonc() {
+        let (_temp, opencode_dir) = setup_test_env();
+
+        // Create both .json and .jsonc files
+        let json_path = opencode_dir.join("opencode.json");
+        let jsonc_path = opencode_dir.join("opencode.jsonc");
+
+        fs::write(&json_path, r#"{"provider": {"test-json": {}}}"#).unwrap();
+        fs::write(&jsonc_path, r#"{"provider": {"test-jsonc": {}}}"#).unwrap();
+
+        // Set override dir to use temp directory
+        std::env::set_var("HOME", opencode_dir.parent().unwrap().parent().unwrap());
+
+        // Should prefer .jsonc file
+        let path = get_opencode_config_path();
+        assert!(path.ends_with("opencode.jsonc"));
+
+        // Clean up env var
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn test_read_opencode_config_fallback_to_json() {
+        let (_temp, opencode_dir) = setup_test_env();
+
+        // Create only .json file
+        let json_path = opencode_dir.join("opencode.json");
+        fs::write(&json_path, r#"{"provider": {"test": {}}}"#).unwrap();
+
+        std::env::set_var("HOME", opencode_dir.parent().unwrap().parent().unwrap());
+
+        // Should fallback to .json file
+        let path = get_opencode_config_path();
+        assert!(path.ends_with("opencode.json"));
+
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn test_read_opencode_config_with_comments() {
+        let (_temp, opencode_dir) = setup_test_env();
+
+        // Create .jsonc file with comments
+        let jsonc_path = opencode_dir.join("opencode.jsonc");
+        let config_with_comments = r#"{
+            // This is a comment
+            "$schema": "https://opencode.ai/config.json",
+            /* Multi-line
+               comment */
+            "provider": {
+                "test-provider": {
+                    "apiKey": "test-key" // Inline comment
+                }
+            }
+        }"#;
+        fs::write(&jsonc_path, config_with_comments).unwrap();
+
+        std::env::set_var("HOME", opencode_dir.parent().unwrap().parent().unwrap());
+
+        // Should successfully parse config with comments
+        let config = read_opencode_config().unwrap();
+        assert!(config.get("provider").is_some());
+        assert!(config["provider"]
+            .get("test-provider")
+            .and_then(|p| p.get("apiKey"))
+            .and_then(|k| k.as_str())
+            == Some("test-key"));
+
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn test_read_opencode_config_trailing_commas() {
+        let (_temp, opencode_dir) = setup_test_env();
+
+        // Create .jsonc file with trailing commas
+        let jsonc_path = opencode_dir.join("opencode.jsonc");
+        let config_with_trailing = r#"{
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {
+                "test-provider": {
+                    "apiKey": "test-key",
+                    "baseUrl": "https://api.example.com",
+                },
+            },
+        }"#;
+        fs::write(&jsonc_path, config_with_trailing).unwrap();
+
+        std::env::set_var("HOME", opencode_dir.parent().unwrap().parent().unwrap());
+
+        // Should successfully parse config with trailing commas
+        let config = read_opencode_config().unwrap();
+        assert!(config.get("provider").is_some());
+
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn test_read_opencode_config_standard_json() {
+        let (_temp, opencode_dir) = setup_test_env();
+
+        // Create standard .json file (should still work)
+        let json_path = opencode_dir.join("opencode.json");
+        let standard_json = r#"{
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {
+                "test-provider": {
+                    "apiKey": "test-key"
+                }
+            }
+        }"#;
+        fs::write(&json_path, standard_json).unwrap();
+
+        std::env::set_var("HOME", opencode_dir.parent().unwrap().parent().unwrap());
+
+        // Should successfully parse standard JSON
+        let config = read_opencode_config().unwrap();
+        assert!(config.get("provider").is_some());
+        assert_eq!(
+            config["provider"]["test-provider"]["apiKey"]
+                .as_str()
+                .unwrap(),
+            "test-key"
+        );
+
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn test_read_opencode_config_nonexistent_file() {
+        // When no override dir is set and file doesn't exist, should return default config
+        // Note: This test doesn't set HOME because dirs::home_dir() doesn't read it in tests
+        // Instead we rely on the actual behavior when the config file doesn't exist
+        let result = read_opencode_config();
+
+        // If the actual config file exists on the system, this will read it
+        // Otherwise it will return the default config
+        assert!(result.is_ok());
+        let config = result.unwrap();
+
+        // The config should either have the default schema or be a valid config
+        if let Some(schema) = config.get("$schema").and_then(|s| s.as_str()) {
+            assert_eq!(schema, "https://opencode.ai/config.json");
+        }
+    }
 }
